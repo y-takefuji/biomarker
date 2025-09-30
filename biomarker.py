@@ -2,12 +2,10 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.feature_selection import SelectKBest, f_classif
-from sklearn.cluster import FeatureAgglomeration
 from sklearn.model_selection import cross_val_score
-from sklearn.preprocessing import StandardScaler
-import xgboost as xgb
+from sklearn.cluster import FeatureAgglomeration
 from scipy.stats import spearmanr
+import xgboost as xgb
 import openml
 
 # Download the dataset with ID 43403 from OpenML
@@ -36,7 +34,8 @@ def evaluate_features(X_selected, y, model_name='rf'):
         model = xgb.XGBClassifier(n_estimators=100, random_state=42)
     elif model_name == 'lr':
         model = LogisticRegression(max_iter=1000, random_state=42)
-    
+    else:
+        raise ValueError("model_name must be one of: 'rf', 'xgb', 'lr'")
     scores = cross_val_score(model, X_selected, y, cv=5, scoring='accuracy')
     return scores.mean()
 
@@ -44,12 +43,8 @@ def evaluate_features(X_selected, y, model_name='rf'):
 def rf_feature_selection(X, y, k=5):
     rf = RandomForestClassifier(n_estimators=100, random_state=42)
     rf.fit(X, y)
-    
-    # Get feature importances
     importances = rf.feature_importances_
     indices = np.argsort(importances)[::-1]
-    
-    # Select top k features
     selected_features = X.columns[indices[:k]].tolist()
     highest_feature = X.columns[indices[0]]
     return selected_features, highest_feature
@@ -58,12 +53,8 @@ def rf_feature_selection(X, y, k=5):
 def xgb_feature_selection(X, y, k=5):
     model = xgb.XGBClassifier(n_estimators=100, random_state=42)
     model.fit(X, y)
-    
-    # Get feature importances
     importances = model.feature_importances_
     indices = np.argsort(importances)[::-1]
-    
-    # Select top k features
     selected_features = X.columns[indices[:k]].tolist()
     highest_feature = X.columns[indices[0]]
     return selected_features, highest_feature
@@ -72,80 +63,59 @@ def xgb_feature_selection(X, y, k=5):
 def lr_feature_selection(X, y, k=5):
     model = LogisticRegression(max_iter=1000, random_state=42)
     model.fit(X, y)
-    
-    # Get feature importances (absolute coefficients)
     importances = np.abs(model.coef_[0])
     indices = np.argsort(importances)[::-1]
-    
-    # Select top k features
     selected_features = X.columns[indices[:k]].tolist()
     highest_feature = X.columns[indices[0]]
     return selected_features, highest_feature
 
-# ---- Feature Agglomeration ----
-def feature_agglomeration(X, y, k=5):
-    # Create Feature Agglomeration
-    n_clusters = int(X.shape[1] * 0.2)  # Select 20% of features
-    n_clusters = max(n_clusters, k)  # Ensure we have at least k clusters
-    
-    # Calculate correlation distance matrix
-    X_values = X.values  # Convert DataFrame to NumPy array
-    corr = np.abs(np.corrcoef(X_values.T))
-    corr_dist = 1 - corr
-    
-    # Calculate variance for each feature
-    variances = np.var(X_values, axis=0)
-    var_matrix = np.zeros((len(variances), len(variances)))
-    
-    for i in range(len(variances)):
-        for j in range(len(variances)):
-            var_matrix[i, j] = abs(variances[i] - variances[j])
-    
-    # Normalize the variance matrix
-    if np.max(var_matrix) > 0:
-        var_matrix = var_matrix / np.max(var_matrix)
-    
-    # Combine correlation distance and variance with given ratio
-    combined_dist = 0.2 * corr_dist + 0.8 * var_matrix
-    
-    # Using FeatureAgglomeration with the combined distance
-    agglo = FeatureAgglomeration(n_clusters=n_clusters)
-    agglo.fit(combined_dist)
-    
-    # Extract top features from each cluster
-    top_features = []
-    feature_names = X.columns.tolist()
-    
-    # For each cluster, find the feature with highest variance
-    for cluster_idx in range(n_clusters):
-        cluster_features_idx = np.where(agglo.labels_ == cluster_idx)[0]
-        if len(cluster_features_idx) > 0:
-            # Get features in this cluster
-            cluster_features = [feature_names[i] for i in cluster_features_idx]
-            cluster_X = X[cluster_features]
-            cluster_variances = cluster_X.var().values
-            
-            # Select the feature with highest variance in this cluster
-            best_feature_idx = np.argmax(cluster_variances)
-            top_features.append(cluster_features[best_feature_idx])
-            
-            if len(top_features) >= k:
-                break
-    
-    # Ensure we have k features
-    top_features = top_features[:k]
-    highest_feature = top_features[0] if top_features else None
-    return top_features, highest_feature
+# ---- Feature Agglomeration (fit on raw data; select top across clusters) ----
+def feature_agglomeration(X, y=None, k=5):
+    n_clusters = 5
+    fa = FeatureAgglomeration(n_clusters=n_clusters)
+    fa.fit(X.values)
+    clusters = fa.labels_
 
-# ---- Highly Variable Gene Selection (adapting for general feature selection) ----
+    # Calculate variance for each feature (raw scale)
+    variances = X.var().to_dict()
+
+    # Create list of (feature, variance, cluster) tuples
+    feature_info = [(col, variances[col], clusters[i]) for i, col in enumerate(X.columns)]
+
+    # Sort by variance descending
+    feature_info.sort(key=lambda x: x[1], reverse=True)
+
+    # Track selected clusters to avoid duplicates initially
+    selected_clusters = set()
+    selected_features = []
+    feature_rankings = {}
+
+    # Select top features across all clusters (one per cluster first)
+    for feature, variance, cluster in feature_info:
+        if len(selected_features) >= k:
+            break
+        if cluster not in selected_clusters:
+            selected_features.append(feature)
+            selected_clusters.add(cluster)
+            feature_rankings[feature] = variance
+
+    # If we still need more features, allow multiple from same cluster
+    if len(selected_features) < k:
+        remaining = [f for f, v, c in feature_info if f not in selected_features]
+        for feature in remaining:
+            if len(selected_features) >= k:
+                break
+            # Retrieve variance for ranking dict for completeness
+            feature_rankings[feature] = variances[feature]
+            selected_features.append(feature)
+
+    highest_feature = selected_features[0] if selected_features else None
+    return selected_features[:k], highest_feature
+
+# ---- Highly Variable Gene Selection (variance-based) ----
 def hvgs_selection(X, y, k=5):
-    # Calculate variance for each feature
     variances = X.var()
-    
-    # Sort features by variance
     sorted_features = variances.sort_values(ascending=False)
-    
-    # Select top k features with highest variance
     selected_features = sorted_features.index[:k].tolist()
     highest_feature = sorted_features.index[0] if not sorted_features.empty else None
     return selected_features, highest_feature
@@ -153,16 +123,10 @@ def hvgs_selection(X, y, k=5):
 # ---- Spearman Correlation ----
 def spearman_selection(X, y, k=5):
     correlations = []
-    
-    # Calculate Spearman correlation for each feature with the target
     for col in X.columns:
         corr, _ = spearmanr(X[col], y)
         correlations.append((col, abs(corr)))
-    
-    # Sort by absolute correlation
     correlations.sort(key=lambda x: x[1], reverse=True)
-    
-    # Select top k features
     selected_features = [corr[0] for corr in correlations[:k]]
     highest_feature = correlations[0][0] if correlations else None
     return selected_features, highest_feature
@@ -207,7 +171,7 @@ print(f"Spearman Correlation features: {spearman_score:.4f}")
 X_rf_reduced = X.drop(columns=[rf_top])
 X_xgb_reduced = X.drop(columns=[xgb_top])
 X_lr_reduced = X.drop(columns=[lr_top])
-X_fa_reduced = X.drop(columns=[fa_top])
+X_fa_reduced = X.drop(columns=[fa_top]) if fa_top is not None else X.copy()
 X_hvgs_reduced = X.drop(columns=[hvgs_top])
 X_spearman_reduced = X.drop(columns=[spearman_top])
 
